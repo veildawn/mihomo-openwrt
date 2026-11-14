@@ -8,3 +8,4 @@ dl/
 files/usr/bin/mihomo
 files/usr/share/mihomo/
 firmware-package/files/usr/share/mihomo/
+.DS_Store
