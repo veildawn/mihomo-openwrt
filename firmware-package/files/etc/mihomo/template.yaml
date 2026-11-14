@@ -1,5 +1,5 @@
 # ============================================================
-# mihomo (Clash.Meta) for f50clean / UMS9620 (aarch64)
+# mihomo (Clash.Meta) for OpenWrt (aarch64)
 # TUN + 内核转发 方式接管局域网全部流量
 # 订阅在 LuCI → 服务 → Mihomo → 订阅 中管理；本文件是模板，
 # /usr/libexec/mihomo-genconf 用当前订阅填充占位符后生成 config.yaml。

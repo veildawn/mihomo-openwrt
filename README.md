@@ -1,13 +1,12 @@
 # mihomo for OpenWrt（aarch64 / apk）
 
-标准 .apk 安装包，来自 `f50-openwrt` 的 `custom/mihomo-port`（自写 LuCI 界面）。
+标准 .apk 安装包：mihomo 内核 + 服务脚本 + LuCI 管理界面。
 
 | 组件 | 版本/来源 |
 |---|---|
 | .apk 包 | `mihomo-1.19.34-r1.apk`（apk-tools v3 格式，未签名，安装加 `--allow-untrusted`） |
 | mihomo 核心 | v1.19.34 官方 `mihomo-linux-arm64`（静态链接） |
 | GEO 数据 | MetaCubeX/meta-rules-dat `latest`（geoip.metadb + GeoSite.dat 随包附带） |
-| 服务/脚本/LuCI | f50-openwrt `custom/mihomo-port` 原样未改 |
 
 ## 安装（标准 apk 依赖解析）
 

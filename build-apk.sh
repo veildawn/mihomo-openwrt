@@ -44,7 +44,7 @@ docker run --rm -v "$(cd .. && pwd)":/w -w /w alpine:edge apk mkpkg \
 	--info "name:mihomo" --info "version:$VER-r1" \
 	--info "description:mihomo (Clash.Meta) kernel + service + LuCI app" \
 	--info "arch:aarch64_cortex-a53" --info "license:GPL-3.0" \
-	--info "origin:f50-openwrt/custom/mihomo-port" \
+	--info "origin:mihomo-openwrt" \
 	--info "url:https://github.com/MetaCubeX/mihomo" --info "maintainer:veildawn" \
 	--info "depends:curl ucode-mod-uci rpcd-mod-ucode rpcd jsonfilter ca-bundle" \
 	--script post-install:/w/mihomo-openwrt/scripts/post-install \

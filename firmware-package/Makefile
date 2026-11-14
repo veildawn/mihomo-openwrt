@@ -40,8 +40,8 @@ define Package/mihomo
 endef
 
 define Package/mihomo/description
-  mihomo (Clash.Meta) 内核 + 服务脚本 + 自写 LuCI 界面，来自
-  f50-openwrt custom/mihomo-port。TUN + auto-route 全局域网透明代理。
+  mihomo (Clash.Meta) 内核 + 服务脚本 + LuCI 管理界面。
+  TUN + auto-route 全局域网透明代理。
   订阅在 LuCI -> 服务 -> Mihomo -> 订阅 管理；/etc/config/mihomo
   预置订阅时刷机后开机即用。
 endef

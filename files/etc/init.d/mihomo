@@ -1,5 +1,5 @@
 #!/bin/sh /etc/rc.common
-# mihomo (Clash.Meta) service for f50clean / OpenWrt
+# mihomo (Clash.Meta) service for OpenWrt
 #   /etc/init.d/mihomo start|stop|restart|status|update|log
 START=99
 STOP=10
