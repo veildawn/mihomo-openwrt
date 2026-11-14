@@ -1,0 +1,12 @@
+# 可选：预置订阅（烤入固件，刷机后开机即用）——填你自己的订阅 URL，
+# active 填对应 section 名。不想烤入就删掉本文件，刷机后在
+# LuCI -> 服务 -> Mihomo -> 订阅 里添加。secret 首次启动自动生成。
+config mihomo 'main'
+	option active ''
+	option secret ''
+
+# 示例（去掉注释并填 URL）:
+# config profile 'sub'
+# 	option name '我的订阅'
+# 	option url 'https://example.com/api/v1/sub/xxxxx'
+# 	option interval '3600'

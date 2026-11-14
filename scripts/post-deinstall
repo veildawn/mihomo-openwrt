@@ -1,0 +1,13 @@
+#!/bin/sh
+# mihomo post-deinstall: 停服务、清防火墙 zone
+# /etc/mihomo（订阅 provider）与 /etc/config/mihomo（订阅列表）不属于包文件，保留
+/etc/init.d/mihomo stop >/dev/null 2>&1
+pkill -f '^/usr/bin/mihomo -d ' 2>/dev/null
+# init 脚本此时已被 apk 删除，disable 失效，直接清 enable 留下的链接
+rm -f /etc/rc.d/*mihomo
+uci -q delete firewall.mihomo
+uci -q delete firewall.lan_mihomo
+uci -q commit firewall
+/etc/init.d/firewall reload >/dev/null 2>&1
+/etc/init.d/rpcd restart >/dev/null 2>&1
+exit 0

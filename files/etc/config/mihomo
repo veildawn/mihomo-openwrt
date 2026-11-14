@@ -1,0 +1,5 @@
+config mihomo 'main'
+	# section name of the profile in use; empty = mihomo is not started
+	option active ''
+	# external-controller secret, generated on first boot
+	option secret ''

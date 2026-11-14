@@ -1,0 +1,23 @@
+#!/bin/sh
+# mihomo post-install: 初始 UCI 配置、防火墙 zone、服务启用
+[ -e /dev/net/tun ] || modprobe tun 2>/dev/null
+
+# /etc/config/mihomo（订阅与 API secret）不属于包文件（保护用户订阅，
+# apk del 不动它）；uci 无法凭空创建配置包，所以先落一个空骨架再跑 defaults
+if [ ! -f /etc/config/mihomo ]; then
+	printf "config mihomo 'main'\n\toption active ''\n\toption secret ''\n" > /etc/config/mihomo
+fi
+sh /etc/uci-defaults/99-mihomo || true
+
+/etc/init.d/firewall reload >/dev/null 2>&1 || /etc/init.d/firewall restart >/dev/null 2>&1
+/etc/init.d/rpcd restart >/dev/null 2>&1
+/etc/init.d/mihomo enable
+
+if [ -e /dev/net/tun ]; then
+	/etc/init.d/mihomo restart >/dev/null 2>&1
+else
+	echo "mihomo: /dev/net/tun 不存在（缺 kmod-tun，自编译内核无法在线安装）" >&2
+	echo "mihomo: 服务已 enable 未启动；固件加入 CONFIG_PACKAGE_kmod-tun=y 后执行:" >&2
+	echo "mihomo:   /etc/init.d/mihomo start" >&2
+fi
+exit 0

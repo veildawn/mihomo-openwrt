@@ -1,0 +1,386 @@
+# ============================================================
+# mihomo (Clash.Meta) for f50clean / UMS9620 (aarch64)
+# TUN + 内核转发 方式接管局域网全部流量
+# 订阅在 LuCI → 服务 → Mihomo → 订阅 中管理；本文件是模板，
+# /usr/libexec/mihomo-genconf 用当前订阅填充占位符后生成 config.yaml。
+# ============================================================
+
+# ---- 入口：HTTP/SOCKS 混合代理（仅监听本机，给路由器自身工具用） ----
+mixed-port: 7890
+allow-lan: false
+bind-address: 127.0.0.1
+mode: rule
+log-level: warning
+ipv6: true
+
+# ---- 外部控制面板（局域网内可用 yacd/metacubexd 连接） ----
+external-controller: 0.0.0.0:9090
+secret: "__MIHOMO_SECRET__"
+external-controller-cors:
+  allow-origins:
+    - "*"
+  allow-private-network: true
+
+# ---- Geo 数据（jsdelivr 镜像，raw.githubusercontent 在部分网络下不可达） ----
+geo-auto-update: true
+geo-update-interval: 24
+
+geox-url:
+  geoip: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.dat"
+  geosite: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geosite.dat"
+  mmdb: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.metadb"
+
+# ---- 工作目录 ----
+# mihomo 的 -d 参数指向 /etc/mihomo，rule-set/provider 均相对此目录
+
+# ---- 全局出口 ----
+find-process-mode: off
+unified-delay: true
+tcp-concurrent: true
+keep-alive-interval: 15
+keep-alive-idle: 600
+disable-keep-alive: false
+
+# ---- 订阅（由当前选中的订阅填充） ----
+proxy-providers:
+  Subscription:
+    type: http
+    url: "__SUBSCRIPTION_URL__"
+    interval: __SUBSCRIPTION_INTERVAL__
+    path: ./providers/__PROFILE_ID__.yaml
+    proxy: DIRECT
+    header:
+      User-Agent:
+        - "__USER_AGENT__"
+    health-check:
+      enable: true
+      interval: 300
+      url: https://cp.cloudflare.com/generate_204
+      lazy: false
+    override:
+      udp: true
+
+# ---- 代理组（订阅内已有同名节点，use 会自动引用） ----
+proxy-groups:
+  - name: "节点选择"
+    type: select
+    use: [Subscription]
+  - name: "自动选择"
+    type: url-test
+    use: [Subscription]
+    url: "http://cp.cloudflare.com/generate_204"
+    interval: 300
+    tolerance: 50
+  - name: "🇭🇰 香港"
+    type: url-test
+    use: [Subscription]
+    filter: "(?i)HK"
+    url: "http://cp.cloudflare.com/generate_204"
+    interval: 300
+    tolerance: 50
+  - name: "🇸🇬 新加坡"
+    type: url-test
+    use: [Subscription]
+    filter: "(?i)SG"
+    url: "http://cp.cloudflare.com/generate_204"
+    interval: 300
+    tolerance: 50
+  - name: "🇺🇸 美国"
+    type: url-test
+    use: [Subscription]
+    filter: "(?i)US"
+    url: "http://cp.cloudflare.com/generate_204"
+    interval: 300
+    tolerance: 50
+  - name: "DIRECT-GROUP"
+    type: select
+    proxies: [DIRECT]
+  - name: "REJECT-GROUP"
+    type: select
+    proxies: [REJECT]
+
+# ---- TUN（内核转发，局域网设备走路由器即可） ----
+tun:
+  enable: true
+  stack: system
+  auto-route: true
+  auto-detect-interface: true
+  strict-route: false
+  auto-redirect: false
+  dns-hijack:
+    - any:53
+  mtu: 9000
+  route-exclude-address:
+    - 192.168.0.0/16
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 127.0.0.0/8
+    - 100.64.0.0/10
+    - 169.254.0.0/16
+    - 224.0.0.0/4
+    - "fe80::/10"
+    - "fc00::/7"
+    - "ff00::/8"
+
+# ---- DNS ----
+dns:
+  enable: true
+  ipv6: true
+  listen: 127.0.0.1:1053
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - "+.tailscale.com"
+    - "+.tailscale.io"
+    - "+.ts.net"
+    - "*.lan"
+    - "*.local"
+    - "*.localdomain"
+    - "*.arpa"
+    - "+.msftconnecttest.com"
+    - "+.msftncsi.com"
+    - "localhost.ptlogin2.qq.com"
+    - "+.stun.*.*"
+    - "time.*.com"
+    - "ntp.*.com"
+    - "+.pool.ntp.org"
+    - "lens.l.google.com"
+    - "+.market.xiaomi.com"
+    - "www.baidu.com"
+    - "+.bilibili.com"
+    - "+.bilivideo.com"
+    - "+.bilivideo.cn"
+    - "+.acgvideo.com"
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  nameserver:
+    - https://doh.pub/dns-query
+    - https://dns.alidns.com/dns-query
+    - 223.5.5.5
+    - 119.29.29.29
+  fallback:
+    - https://dns.google/dns-query
+    - https://cloudflare-dns.com/dns-query
+  fallback-filter:
+    geoip: false
+    ipcidr:
+      - 240.0.0.0/4
+      - 0.0.0.0/32
+  nameserver-policy:
+    "geosite:cn,private":
+      - https://doh.pub/dns-query
+      - 223.5.5.5
+
+# ---- 流量识别 ----
+profile:
+  store-selected: true
+  store-fake-ip: true
+
+sniffer:
+  enable: true
+  force-dns-mapping: true
+  parse-pure-ip: true
+  override-destination: false
+  sniff:
+    HTTP:
+      ports: [80, 8080-8880]
+      override-destination: true
+    TLS:
+      ports: [443, 8443]
+    QUIC:
+      ports: [443, 8443]
+
+# ---- 规则集 ----
+rule-providers:
+  Ai:
+    type: http
+    behavior: classical
+    path: ./ruleset/Ai.list
+    url: "https://raw.githubusercontent.com/veildawn/cross-rules/main/mihomo/ai.list"
+    interval: 86400
+    format: text
+  Appletv:
+    type: http
+    behavior: classical
+    path: ./ruleset/Appletv.list
+    url: "https://raw.githubusercontent.com/veildawn/cross-rules/main/mihomo/streaming/appletv.list"
+    interval: 86400
+    format: text
+  BilibiliIntl:
+    type: http
+    behavior: classical
+    path: ./ruleset/BilibiliIntl.list
+    url: "https://raw.githubusercontent.com/veildawn/cross-rules/main/mihomo/streaming/bilibili-intl.list"
+    interval: 86400
+    format: text
+  Claude:
+    type: http
+    behavior: classical
+    path: ./ruleset/Claude.list
+    url: "https://raw.githubusercontent.com/veildawn/cross-rules/main/mihomo/claude.list"
+    interval: 86400
+    format: text
+  Cloudflare:
+    type: http
+    behavior: classical
+    path: ./ruleset/Cloudflare.list
+    url: "https://raw.githubusercontent.com/veildawn/cross-rules/main/mihomo/cloudflare.list"
+    interval: 86400
+    format: text
+  DNS:
+    type: http
+    behavior: classical
+    path: ./ruleset/DNS.list
+    url: "https://raw.githubusercontent.com/veildawn/cross-rules/main/mihomo/intl-dns.list"
+    interval: 86400
+    format: text
+  Disney:
+    type: http
+    behavior: classical
+    path: ./ruleset/Disney.list
+    url: "https://raw.githubusercontent.com/veildawn/cross-rules/main/mihomo/streaming/disney.list"
+    interval: 86400
+    format: text
+  Dmm:
+    type: http
+    behavior: classical
+    path: ./ruleset/Dmm.list
+    url: "https://raw.githubusercontent.com/veildawn/cross-rules/main/mihomo/streaming/dmm.list"
+    interval: 86400
+    format: text
+  Entertainment:
+    type: http
+    behavior: classical
+    path: ./ruleset/Entertainment.list
+    url: "https://raw.githubusercontent.com/veildawn/cross-rules/main/mihomo/entertainment.list"
+    interval: 86400
+    format: text
+  Google:
+    type: http
+    behavior: classical
+    path: ./ruleset/Google.list
+    url: "https://raw.githubusercontent.com/veildawn/cross-rules/main/mihomo/google.list"
+    interval: 86400
+    format: text
+  Hbomax:
+    type: http
+    behavior: classical
+    path: ./ruleset/Hbomax.list
+    url: "https://raw.githubusercontent.com/veildawn/cross-rules/main/mihomo/streaming/hbomax.list"
+    interval: 86400
+    format: text
+  Media:
+    type: http
+    behavior: classical
+    path: ./ruleset/Media.list
+    url: "https://raw.githubusercontent.com/veildawn/cross-rules/main/mihomo/media.list"
+    interval: 86400
+    format: text
+  Netflix:
+    type: http
+    behavior: classical
+    path: ./ruleset/Netflix.list
+    url: "https://raw.githubusercontent.com/veildawn/cross-rules/main/mihomo/streaming/netflix.list"
+    interval: 86400
+    format: text
+  Primevideo:
+    type: http
+    behavior: classical
+    path: ./ruleset/Primevideo.list
+    url: "https://raw.githubusercontent.com/veildawn/cross-rules/main/mihomo/streaming/primevideo.list"
+    interval: 86400
+    format: text
+  RateLimited:
+    type: http
+    behavior: classical
+    path: ./ruleset/RateLimited.list
+    url: "https://raw.githubusercontent.com/veildawn/cross-rules/main/mihomo/rate-limited.list"
+    interval: 86400
+    format: text
+  Spotify:
+    type: http
+    behavior: classical
+    path: ./ruleset/Spotify.list
+    url: "https://raw.githubusercontent.com/veildawn/cross-rules/main/mihomo/streaming/spotify.list"
+    interval: 86400
+    format: text
+  Steam:
+    type: http
+    behavior: classical
+    path: ./ruleset/Steam.list
+    url: "https://raw.githubusercontent.com/veildawn/cross-rules/main/mihomo/streaming/steam.list"
+    interval: 86400
+    format: text
+  Tiktok:
+    type: http
+    behavior: classical
+    path: ./ruleset/Tiktok.list
+    url: "https://raw.githubusercontent.com/veildawn/cross-rules/main/mihomo/streaming/tiktok.list"
+    interval: 86400
+    format: text
+  Twitch:
+    type: http
+    behavior: classical
+    path: ./ruleset/Twitch.list
+    url: "https://raw.githubusercontent.com/veildawn/cross-rules/main/mihomo/streaming/twitch.list"
+    interval: 86400
+    format: text
+  Web3:
+    type: http
+    behavior: classical
+    path: ./ruleset/Web3.list
+    url: "https://raw.githubusercontent.com/veildawn/cross-rules/main/mihomo/web3.list"
+    interval: 86400
+    format: text
+  Youtube:
+    type: http
+    behavior: classical
+    path: ./ruleset/Youtube.list
+    url: "https://raw.githubusercontent.com/veildawn/cross-rules/main/mihomo/streaming/youtube.list"
+    interval: 86400
+    format: text
+  "开发者":
+    type: http
+    behavior: classical
+    path: ./ruleset/开发者.list
+    url: "https://raw.githubusercontent.com/veildawn/cross-rules/main/mihomo/developer.list"
+    interval: 86400
+    format: text
+  "社交":
+    type: http
+    behavior: classical
+    path: ./ruleset/社交.list
+    url: "https://raw.githubusercontent.com/veildawn/cross-rules/main/mihomo/social.list"
+    interval: 86400
+    format: text
+
+rules:
+  - DST-PORT,123,DIRECT
+  - RULE-SET,DNS,🇭🇰 香港
+  - RULE-SET,Claude,🇺🇸 美国
+  - RULE-SET,Ai,🇺🇸 美国
+  - RULE-SET,Google,🇺🇸 美国
+  - RULE-SET,开发者,🇭🇰 香港
+  - RULE-SET,Web3,节点选择
+  - RULE-SET,Cloudflare,🇭🇰 香港
+  - RULE-SET,Steam,🇭🇰 香港
+  - RULE-SET,社交,🇭🇰 香港
+  - RULE-SET,Netflix,🇭🇰 香港
+  - RULE-SET,Disney,🇭🇰 香港
+  - RULE-SET,Youtube,🇭🇰 香港
+  - RULE-SET,Spotify,🇭🇰 香港
+  - RULE-SET,Tiktok,🇭🇰 香港
+  - RULE-SET,Hbomax,🇭🇰 香港
+  - RULE-SET,Primevideo,🇭🇰 香港
+  - RULE-SET,Appletv,🇭🇰 香港
+  - RULE-SET,Twitch,🇭🇰 香港
+  - RULE-SET,BilibiliIntl,🇭🇰 香港
+  - RULE-SET,Dmm,节点选择
+  - RULE-SET,Media,节点选择
+  - RULE-SET,Entertainment,节点选择
+  - RULE-SET,RateLimited,节点选择
+  - GEOSITE,category-ads-all,REJECT
+  - GEOIP,private,DIRECT,no-resolve
+  - GEOIP,cn,DIRECT
+  - MATCH,节点选择

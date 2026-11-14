@@ -1,0 +1,68 @@
+{
+	"admin/services/mihomo": {
+		"title": "Mihomo",
+		"order": 10,
+		"action": {
+			"type": "alias",
+			"path": "admin/services/mihomo/overview"
+		},
+		"depends": {
+			"acl": [ "luci-app-mihomo" ],
+			"fs": { "/usr/bin/mihomo": "executable" }
+		}
+	},
+
+	"admin/services/mihomo/overview": {
+		"title": "概览",
+		"order": 10,
+		"action": {
+			"type": "view",
+			"path": "mihomo/overview"
+		}
+	},
+
+	"admin/services/mihomo/subscriptions": {
+		"title": "订阅",
+		"order": 15,
+		"action": {
+			"type": "view",
+			"path": "mihomo/subscriptions"
+		}
+	},
+
+	"admin/services/mihomo/proxies": {
+		"title": "代理",
+		"order": 20,
+		"action": {
+			"type": "view",
+			"path": "mihomo/proxies"
+		}
+	},
+
+	"admin/services/mihomo/connections": {
+		"title": "连接",
+		"order": 30,
+		"action": {
+			"type": "view",
+			"path": "mihomo/connections"
+		}
+	},
+
+	"admin/services/mihomo/config": {
+		"title": "配置模板",
+		"order": 40,
+		"action": {
+			"type": "view",
+			"path": "mihomo/config"
+		}
+	},
+
+	"admin/services/mihomo/log": {
+		"title": "日志",
+		"order": 50,
+		"action": {
+			"type": "view",
+			"path": "mihomo/log"
+		}
+	}
+}

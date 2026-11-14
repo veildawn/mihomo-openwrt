@@ -1,0 +1,10 @@
+# 构建产物（build-apk.sh 从源码完整重建）
+*.apk
+*.tar.gz
+apk-root/
+dl/
+
+# 下载产物：mihomo 二进制与 GEO 数据库（构建时按需拉取）
+files/usr/bin/mihomo
+files/usr/share/mihomo/
+firmware-package/files/usr/share/mihomo/

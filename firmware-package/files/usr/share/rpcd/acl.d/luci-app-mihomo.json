@@ -1,0 +1,15 @@
+{
+	"luci-app-mihomo": {
+		"description": "Grant access to mihomo management",
+		"read": {
+			"ubus": {
+				"luci.mihomo": [ "status", "get_config", "log", "profiles", "update_status" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"luci.mihomo": [ "service", "api", "set_config", "profile_save", "profile_delete", "profile_activate", "profile_update", "update_start" ]
+			}
+		}
+	}
+}

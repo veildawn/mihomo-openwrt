@@ -1,0 +1,496 @@
+#!/usr/bin/ucode
+// rpcd backend for luci-app-mihomo
+// Talks to the local mihomo external-controller so the API secret never
+// leaves the router, and wraps service / config / log handling.
+
+'use strict';
+
+import { readfile, writefile, popen, unlink, rename, stat } from 'fs';
+import { cursor } from 'uci';
+
+const PROG = '/usr/bin/mihomo';
+const DIR = '/etc/mihomo';
+const CONF = DIR + '/config.yaml';
+const TEMPLATE = DIR + '/template.yaml';
+const GENCONF = '/usr/libexec/mihomo-genconf';
+const INIT = '/etc/init.d/mihomo';
+const PROVIDER = 'Subscription';
+const UPDATER = '/usr/libexec/mihomo-update';
+const UPDATE_STATE = '/var/run/mihomo-update.json';
+const UPDATE_LATEST = '/var/run/mihomo-latest.json';
+const UPDATE_LOCK = '/var/lock/mihomo-update.lock';
+const PREV = '/usr/bin/mihomo.prev';
+const GEO_FILES = [ [ 'geoip.metadb', 'GeoIP（IP 归属地）' ], [ 'GeoSite.dat', 'GeoSite（域名分类）' ] ];
+const JOBS = { geo: true, 'core-check': true, core: true, 'core-rollback': true };
+
+const RE_URL = /^https?:\/\/[^[:space:]"]+$/;
+const RE_UA = /^[^"\\\n\r]{1,128}$/;
+
+const API_PATH = /^\/(proxies|providers|connections|configs|version|group|rules|cache|dns)(\/|\?|$)/;
+const METHODS = { GET: true, PUT: true, PATCH: true, POST: true, DELETE: true };
+const ACTIONS = { start: true, stop: true, restart: true, enable: true, disable: true, update: true };
+
+function shellquote(s) {
+	return "'" + replace(s, "'", "'\\''") + "'";
+}
+
+function run(cmd) {
+	const fd = popen(cmd + ' 2>&1', 'r');
+	if (!fd)
+		return { code: -1, output: '' };
+
+	const output = fd.read('all') ?? '';
+	const code = fd.close();
+
+	return { code, output };
+}
+
+function getpid() {
+	const pid = int(trim(split(run("pgrep -f '^/usr/bin/mihomo -d '").output, '\n')[0]));
+	return (pid > 0) ? pid : null;
+}
+
+function controller() {
+	const conf = readfile(CONF) ?? '';
+	let port = '9090', secret = '';
+
+	let m = match(conf, /(^|\n)external-controller:[ \t]*"?([^"\n]*)"?/);
+	if (m) {
+		const p = match(trim(m[2]), /:([0-9]+)$/);
+		if (p)
+			port = p[1];
+	}
+
+	m = match(conf, /(^|\n)secret:[ \t]*"?([^"\n]*)"?/);
+	if (m)
+		secret = trim(m[2]);
+
+	return { url: 'http://127.0.0.1:' + port, secret };
+}
+
+function api(method, path, body) {
+	const c = controller();
+	let cmd = 'curl -s -m 20 -X ' + method + " -w '\\n%{http_code}'";
+	let tmp = null;
+
+	if (c.secret != '')
+		cmd += ' -H ' + shellquote('Authorization: Bearer ' + c.secret);
+
+	if (body != null && body != '') {
+		tmp = sprintf('/tmp/.luci-mihomo.%d.%d', time(), getpid() ?? 0);
+		writefile(tmp, body);
+		cmd += " -H 'Content-Type: application/json' --data-binary @" + tmp;
+	}
+
+	cmd += ' ' + shellquote(c.url + path);
+
+	const fd = popen(cmd, 'r');
+	const out = fd ? (fd.read('all') ?? '') : '';
+	if (fd)
+		fd.close();
+	if (tmp)
+		unlink(tmp);
+
+	const nl = rindex(out, '\n');
+	const status = int(substr(out, nl + 1)) || 0;
+	const text = (nl > 0) ? substr(out, 0, nl) : '';
+	let data = null;
+
+	if (length(text)) {
+		try { data = json(text); }
+		catch (e) { data = text; }
+	}
+
+	return { status, data };
+}
+
+function readjson(path) {
+	try {
+		return json(readfile(path) ?? 'null');
+	}
+	catch (e) {
+		return null;
+	}
+}
+
+function core_version(bin) {
+	const m = match(run(bin + ' -v').output, /Mihomo Meta (v[^ \n]+)/);
+	return m ? m[1] : null;
+}
+
+/* a job holds the lock, or was started a moment ago and has not taken it yet */
+function updater_busy() {
+	if (run('flock -n ' + UPDATE_LOCK + ' true').code != 0)
+		return true;
+
+	const j = readjson(UPDATE_STATE);
+	return j?.state == 'running' && time() - (j?.at ?? 0) < 15;
+}
+
+function profiles(c) {
+	const list = [];
+
+	c.foreach('mihomo', 'profile', (s) => {
+		push(list, {
+			id: s['.name'],
+			name: s.name ?? s['.name'],
+			url: s.url ?? '',
+			user_agent: s.user_agent ?? '',
+			interval: int(s.interval ?? 3600)
+		});
+	});
+
+	return list;
+}
+
+/* render config.yaml for the active profile and (re)start or stop mihomo */
+function apply_active(c) {
+	const active = c.get('mihomo', 'main', 'active');
+
+	if (!active || c.get('mihomo', active) != 'profile')
+		return run(INIT + ' stop');
+
+	const g = run(GENCONF);
+	if (g.code != 0)
+		return g;
+
+	return run(INIT + ' restart');
+}
+
+const methods = {
+	status: {
+		call: function() {
+			const pid = getpid();
+			const ver = match(run(PROG + ' -v').output, /Mihomo Meta (v[^ \n]+)/);
+			const c = cursor();
+			const active = c.get('mihomo', 'main', 'active');
+			const res = {
+				running: pid != null,
+				pid: pid,
+				enabled: run(INIT + ' enabled').code == 0,
+				version: ver ? ver[1] : null,
+				profile_count: length(profiles(c)),
+				active: (active && c.get('mihomo', active) == 'profile') ? active : null,
+				active_name: active ? c.get('mihomo', active, 'name') : null
+			};
+
+			/* fatal exits since boot: procd restarts mihomo after each one, so
+			 * the page would otherwise look fine while it crash-loops */
+			const fatal = filter(split(run("logread -e mihomo | grep 'level=fatal'").output, '\n'), (l) => length(l));
+			if (length(fatal)) {
+				const last = fatal[-1];
+				const m = match(last, /^([A-Z][a-z]{2} [A-Z][a-z]{2} +[0-9]+ [0-9:]+ [0-9]{4})/);
+				const msg = match(last, /msg="(.*)"\s*$/);
+
+				res.crash = { count: length(fatal), at: m ? m[1] : null, msg: msg ? msg[1] : last };
+			}
+
+			if (!pid)
+				return res;
+
+			const st = split(readfile('/proc/' + pid + '/stat') ?? '', ' ');
+			const up = +split(readfile('/proc/uptime') ?? '0', ' ')[0];
+			if (length(st) > 21)
+				res.uptime = int(up - (+st[21]) / 100);
+
+			const rss = match(readfile('/proc/' + pid + '/status') ?? '', /VmRSS:[ \t]+([0-9]+)/);
+			if (rss)
+				res.rss = int(rss[1]) * 1024;
+
+			const cfg = api('GET', '/configs');
+			if (cfg.status == 200 && type(cfg.data) == 'object') {
+				res.mode = cfg.data.mode;
+				res.log_level = cfg.data['log-level'];
+				res.mixed_port = cfg.data['mixed-port'];
+				res.tun = cfg.data.tun?.enable ?? false;
+			}
+
+			const conn = api('GET', '/connections');
+			if (conn.status == 200 && type(conn.data) == 'object') {
+				res.upload_total = conn.data.uploadTotal;
+				res.download_total = conn.data.downloadTotal;
+				res.connections = length(conn.data.connections ?? []);
+			}
+
+			const prov = api('GET', '/providers/proxies');
+			res.providers = [];
+			if (prov.status == 200 && type(prov.data?.providers) == 'object') {
+				for (let name, p in prov.data.providers) {
+					if (p.vehicleType == 'Compatible')
+						continue;
+
+					push(res.providers, {
+						name: name,
+						vehicle: p.vehicleType,
+						count: length(p.proxies ?? []),
+						updated: p.updatedAt,
+						info: p.subscriptionInfo
+					});
+				}
+			}
+
+			return res;
+		}
+	},
+
+	service: {
+		args: { action: 'action' },
+		call: function(req) {
+			const action = req.args?.action;
+			if (!ACTIONS[action])
+				return { code: 1, output: 'invalid action' };
+
+			return run(INIT + ' ' + action);
+		}
+	},
+
+	api: {
+		args: { method: 'GET', path: '/', body: '' },
+		call: function(req) {
+			const method = uc(req.args?.method ?? 'GET');
+			const path = req.args?.path ?? '';
+
+			if (!METHODS[method] || !match(path, API_PATH) || match(path, /[ \t\r\n]|\.\./))
+				return { status: 400, data: 'disallowed' };
+
+			return api(method, path, req.args?.body);
+		}
+	},
+
+	/* the editable config is the template; config.yaml is generated from it */
+	get_config: {
+		call: function() {
+			return { content: readfile(TEMPLATE) ?? '' };
+		}
+	},
+
+	set_config: {
+		args: { content: 'content', test_only: false },
+		call: function(req) {
+			const content = req.args?.content;
+			if (type(content) != 'string' || length(content) == 0)
+				return { ok: false, output: 'empty config' };
+
+			if (index(content, '__SUBSCRIPTION_URL__') < 0)
+				return { ok: false, output: '模板里必须保留 __SUBSCRIPTION_URL__ 占位符（proxy-providers.Subscription.url）' };
+
+			/* render the candidate template with the active profile (or a dummy
+			 * one) and test that, in DIR so relative provider paths resolve */
+			const tmpl = DIR + '/.template.yaml.new';
+			const out = DIR + '/.config.yaml.test';
+			writefile(tmpl, content);
+
+			const c = cursor();
+			const active = c.get('mihomo', 'main', 'active');
+			let g;
+
+			if (active && c.get('mihomo', active) == 'profile') {
+				g = run(GENCONF + ' -t ' + tmpl + ' -o ' + out);
+			}
+			else {
+				writefile(out, replace(replace(replace(replace(replace(content,
+					'__SUBSCRIPTION_URL__', 'http://127.0.0.1/none'), '__SUBSCRIPTION_INTERVAL__', '3600'),
+					'__PROFILE_ID__', 'test'), '__USER_AGENT__', 'mihomo'), '__MIHOMO_SECRET__', ''));
+				g = { code: 0, output: '' };
+			}
+
+			const t = (g.code == 0) ? run(PROG + ' -t -d ' + DIR + ' -f ' + out) : g;
+			unlink(out);
+
+			if (t.code != 0 || req.args?.test_only) {
+				unlink(tmpl);
+				return { ok: t.code == 0, output: t.output };
+			}
+
+			rename(tmpl, TEMPLATE);
+			run(GENCONF);
+
+			return { ok: true, output: t.output };
+		}
+	},
+
+	profiles: {
+		call: function() {
+			const c = cursor();
+			const active = c.get('mihomo', 'main', 'active');
+			const res = { active: active, profiles: profiles(c), provider: null };
+
+			if (getpid()) {
+				const p = api('GET', '/providers/proxies/' + PROVIDER);
+				if (p.status == 200 && type(p.data) == 'object')
+					res.provider = {
+						count: length(p.data.proxies ?? []),
+						updated: p.data.updatedAt,
+						info: p.data.subscriptionInfo
+					};
+			}
+
+			return res;
+		}
+	},
+
+	profile_save: {
+		args: { id: '', name: '', url: '', user_agent: '', interval: 3600 },
+		call: function(req) {
+			const a = req.args;
+			const c = cursor();
+			const name = trim(a.name ?? '');
+			const url = trim(a.url ?? '');
+			const ua = trim(a.user_agent ?? '');
+			const interval = int(a.interval ?? 3600);
+
+			if (!length(name) || length(name) > 48 || match(name, /[\n\r]/))
+				return { ok: false, output: '名称需为 1-48 个字符' };
+			if (!match(url, RE_URL))
+				return { ok: false, output: '订阅链接必须以 http:// 或 https:// 开头，且不能包含空格或引号' };
+			if (ua != '' && !match(ua, RE_UA))
+				return { ok: false, output: 'User-Agent 不能包含引号、反斜杠或换行' };
+			if (!(interval >= 300 && interval <= 604800))
+				return { ok: false, output: '更新间隔需在 300 秒到 7 天之间' };
+
+			/* add() fails silently on a config the cursor has not loaded yet */
+			c.load('mihomo');
+
+			let id = a.id;
+			if (id && c.get('mihomo', id) != 'profile')
+				return { ok: false, output: 'profile not found' };
+
+			if (!id)
+				id = c.add('mihomo', 'profile');
+			if (!id)
+				return { ok: false, output: 'cannot create profile' };
+			c.set('mihomo', id, 'name', name);
+			c.set('mihomo', id, 'url', url);
+			ua != '' ? c.set('mihomo', id, 'user_agent', ua) : c.delete('mihomo', id, 'user_agent');
+			c.set('mihomo', id, 'interval', `${interval}`);
+
+			/* the first subscription becomes active right away */
+			const active = c.get('mihomo', 'main', 'active');
+			const first = !active || c.get('mihomo', active) != 'profile';
+			if (first)
+				c.set('mihomo', 'main', 'active', id);
+
+			c.commit('mihomo');
+
+			/* re-render if the running profile changed or this is the first one */
+			const r = (first || id == active) ? apply_active(c) : { code: 0, output: '' };
+
+			return { ok: r.code == 0, id: id, activated: first, output: r.output };
+		}
+	},
+
+	profile_delete: {
+		args: { id: '' },
+		call: function(req) {
+			const c = cursor();
+			const id = req.args.id;
+
+			if (c.get('mihomo', id) != 'profile')
+				return { ok: false, output: 'profile not found' };
+
+			const was_active = c.get('mihomo', 'main', 'active') == id;
+			c.delete('mihomo', id);
+			unlink(DIR + '/providers/' + id + '.yaml');
+
+			if (was_active) {
+				const rest = profiles(c);
+				c.set('mihomo', 'main', 'active', length(rest) ? rest[0].id : '');
+			}
+
+			c.commit('mihomo');
+
+			const r = was_active ? apply_active(c) : { code: 0, output: '' };
+			return { ok: r.code == 0, output: r.output };
+		}
+	},
+
+	profile_activate: {
+		args: { id: '' },
+		call: function(req) {
+			const c = cursor();
+			const id = req.args.id;
+
+			if (c.get('mihomo', id) != 'profile')
+				return { ok: false, output: 'profile not found' };
+
+			c.set('mihomo', 'main', 'active', id);
+			c.commit('mihomo');
+
+			const r = apply_active(c);
+			return { ok: r.code == 0, output: r.output };
+		}
+	},
+
+	/* refresh the nodes of the active subscription through the controller */
+	profile_update: {
+		call: function() {
+			if (!getpid())
+				return { ok: false, output: 'mihomo 未运行' };
+
+			const r = api('PUT', '/providers/proxies/' + PROVIDER);
+			return { ok: r.status >= 200 && r.status < 300, output: type(r.data) == 'string' ? r.data : (r.data?.message ?? '') };
+		}
+	},
+
+	/* core + GEO data: versions, files, the running/last update job */
+	update_status: {
+		call: function() {
+			const conf = readfile(CONF) ?? '';
+			const auto = match(conf, /(^|\n)geo-auto-update:[ \t]*(true|false)/);
+			const every = match(conf, /(^|\n)geo-update-interval:[ \t]*([0-9]+)/);
+			const job = readjson(UPDATE_STATE);
+
+			return {
+				core: {
+					version: core_version(PROG),
+					prev: stat(PREV) ? core_version(PREV) : null,
+					latest: readjson(UPDATE_LATEST)
+				},
+				geo: map(GEO_FILES, (f) => {
+					const st = stat(DIR + '/' + f[0]);
+					return { file: f[0], label: f[1], size: st?.size, mtime: st?.mtime };
+				}),
+				geo_auto: auto ? auto[2] == 'true' : null,
+				geo_interval: every ? int(every[2]) : null,
+				busy: updater_busy(),
+				job: job
+			};
+		}
+	},
+
+	update_start: {
+		args: { job: '', version: '' },
+		call: function(req) {
+			const job = req.args?.job;
+			const ver = req.args?.version ?? '';
+
+			if (!JOBS[job])
+				return { ok: false, output: 'unknown job' };
+			if (ver != '' && (job != 'core' || !match(ver, /^v[0-9]+\.[0-9]+\.[0-9]+$/)))
+				return { ok: false, output: '版本号格式不对' };
+			if (updater_busy())
+				return { ok: false, output: '已有更新任务在进行' };
+
+			/* written before the spawn so a second click sees the job at once */
+			writefile(UPDATE_STATE, sprintf('%J', { job: job, state: 'running', msg: '准备中', started: time(), at: time() }));
+
+			/* detached: downloads take minutes, rpcd calls time out long before */
+			system(sprintf('( %s %s %s </dev/null >/dev/null 2>&1 & )', UPDATER, job, ver));
+
+			return { ok: true };
+		}
+	},
+
+	log: {
+		args: { lines: 200 },
+		call: function(req) {
+			let n = int(req.args?.lines ?? 200);
+			if (!(n > 0 && n <= 2000))
+				n = 200;
+
+			return { log: run('logread -e mihomo | tail -n ' + n).output };
+		}
+	}
+};
+
+return { 'luci.mihomo': methods };

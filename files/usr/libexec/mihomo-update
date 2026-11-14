@@ -1,0 +1,269 @@
+#!/bin/sh
+# mihomo-update - online updates for the mihomo core and GEO databases
+#
+#   mihomo-update geo              download geoip.metadb + GeoSite.dat, swap in, reload
+#   mihomo-update core-check       look up the latest release (cached for LuCI)
+#   mihomo-update core [vX.Y.Z]    install a release (default: latest), restart
+#   mihomo-update core-rollback    go back to the previous core
+#
+# Progress for LuCI goes to $STATE (JSON); one job at a time ($LOCK).
+# Downloads go through mihomo's own mixed port when it is running (GitHub is
+# often unreachable directly from a Chinese mobile network), then directly,
+# over several mirrors.  Every new file is checked before it replaces the old
+# one, and a core that does not come up is rolled back.
+
+PROG=/usr/bin/mihomo
+PREV=/usr/bin/mihomo.prev
+DIR=/etc/mihomo
+CONF=$DIR/config.yaml
+STATE=/var/run/mihomo-update.json
+LATEST=/var/run/mihomo-latest.json
+LOCK=/var/lock/mihomo-update.lock
+TMP=/tmp/mihomo-update
+REPO=MetaCubeX/mihomo
+GEO_BASE=MetaCubeX/meta-rules-dat
+
+JOB=$1
+STARTED=$(date +%s)
+
+json_str() {
+	printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\n\r'
+}
+
+# state <running|ok|failed> <message> [extra json fields]
+state() {
+	printf '{"job":"%s","state":"%s","msg":"%s","started":%s,"at":%s%s}\n' \
+		"$JOB" "$1" "$(json_str "$2")" "$STARTED" "$(date +%s)" "${3:+,$3}" > "$STATE.tmp" &&
+		mv "$STATE.tmp" "$STATE"
+	logger -t mihomo-update "$JOB: $1: $2"
+}
+
+fail() {
+	state failed "$1"
+	rm -rf "$TMP"
+	exit 1
+}
+
+running() {
+	pgrep -f "^$PROG -d " >/dev/null 2>&1
+}
+
+mixed_port() {
+	sed -n 's/^mixed-port:[ \t]*\([0-9]*\).*/\1/p' "$CONF" 2>/dev/null | head -n 1
+}
+
+# fetch <out> <url>...: first URL that downloads completely, via the proxy
+# first when mihomo runs
+fetch() {
+	local out=$1 url port proxy
+	shift
+
+	port=$(mixed_port)
+	proxy=
+	running && [ -n "$port" ] && proxy="http://127.0.0.1:$port"
+
+	# a route crawling below 20 KB/s for 20 s is dropped for the next one
+	for url in "$@"; do
+		for via in $proxy direct; do
+			if [ "$via" = direct ]; then
+				curl -fsSL --connect-timeout 10 -m 300 -Y 20000 -y 20 -o "$out" "$url" 2>/dev/null && return 0
+			else
+				curl -fsSL --connect-timeout 10 -m 300 -Y 20000 -y 20 -x "$via" -o "$out" "$url" 2>/dev/null && return 0
+			fi
+		done
+	done
+
+	return 1
+}
+
+api() {
+	local method=$1 path=$2 body=$3 port secret
+	port=$(sed -n 's/^external-controller:[ \t]*"\{0,1\}[^:]*:\([0-9]*\).*/\1/p' "$CONF" | head -n 1)
+	secret=$(sed -n 's/^secret:[ \t]*"\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$CONF" | head -n 1)
+	curl -s -m 30 -o /dev/null -w '%{http_code}' -X "$method" \
+		${secret:+-H "Authorization: Bearer $secret"} \
+		${body:+-H 'Content-Type: application/json' --data-binary "$body"} \
+		"http://127.0.0.1:${port:-9090}$path"
+}
+
+# the init script leaves a background subshell (waiting for the tun device)
+# that would inherit the lock fd and keep the next job out for 30 s
+restart_mihomo() {
+	/etc/init.d/mihomo restart 9>&- >/dev/null 2>&1
+}
+
+core_version() {
+	"$1" -v 2>/dev/null | sed -n 's/^Mihomo Meta \(v[^ ]*\).*/\1/p'
+}
+
+mihomo_pid() {
+	pgrep -f "^$PROG -d " | head -n 1
+}
+
+# wait until a new process (not $2) runs and its controller answers, up to
+# $1 seconds; the old process may still answer for a moment after restart
+wait_api() {
+	local i=0 pid
+	while [ "$i" -lt "$1" ]; do
+		pid=$(mihomo_pid)
+		[ -n "$pid" ] && [ "$pid" != "$2" ] && [ "$(api GET /version)" = 200 ] && return 0
+		sleep 1
+		i=$((i + 1))
+	done
+	return 1
+}
+
+geo() {
+	local f size
+
+	mkdir -p "$TMP"
+	state running "正在下载 GeoIP 数据库（geoip.metadb）"
+	fetch "$TMP/geoip.metadb" \
+		"https://github.com/$GEO_BASE/releases/download/latest/geoip.metadb" \
+		"https://testingcf.jsdelivr.net/gh/$GEO_BASE@release/geoip.metadb" \
+		"https://fastly.jsdelivr.net/gh/$GEO_BASE@release/geoip.metadb" ||
+		fail "GeoIP 数据库下载失败：GitHub 和镜像都连不上"
+
+	state running "正在下载 GeoSite 数据库（GeoSite.dat）"
+	fetch "$TMP/GeoSite.dat" \
+		"https://github.com/$GEO_BASE/releases/download/latest/geosite.dat" \
+		"https://testingcf.jsdelivr.net/gh/$GEO_BASE@release/geosite.dat" \
+		"https://fastly.jsdelivr.net/gh/$GEO_BASE@release/geosite.dat" ||
+		fail "GeoSite 数据库下载失败：GitHub 和镜像都连不上"
+
+	state running "正在校验"
+	[ "$(wc -c < "$TMP/geoip.metadb")" -gt 1000000 ] && tail -c 131072 "$TMP/geoip.metadb" | grep -q 'MaxMind.com' ||
+		fail "下载到的 geoip.metadb 不完整"
+	[ "$(wc -c < "$TMP/GeoSite.dat")" -gt 1000000 ] ||
+		fail "下载到的 GeoSite.dat 不完整"
+
+	for f in geoip.metadb GeoSite.dat; do
+		[ -f "$DIR/$f" ] && cp "$DIR/$f" "$TMP/$f.old"
+		cp "$TMP/$f" "$DIR/$f.new" && mv "$DIR/$f.new" "$DIR/$f"
+	done
+
+	# the rules must still load with the new data before mihomo reloads it
+	if ! "$PROG" -t -d "$DIR" -f "$CONF" >/dev/null 2>&1; then
+		for f in geoip.metadb GeoSite.dat; do
+			[ -f "$TMP/$f.old" ] && mv "$TMP/$f.old" "$DIR/$f"
+		done
+		fail "新的数据库无法加载，已恢复原来的"
+	fi
+
+	if running; then
+		state running "正在让 mihomo 重新加载规则"
+		size=$(api PUT '/configs?force=true' "{\"path\":\"$CONF\"}")
+		case "$size" in
+			2*) ;;
+			*) restart_mihomo ;;
+		esac
+	fi
+
+	rm -rf "$TMP"
+	state ok "GEO 数据库已更新"
+}
+
+core_check() {
+	mkdir -p "$TMP"
+	state running "正在查询最新版本"
+	fetch "$TMP/release.json" "https://api.github.com/repos/$REPO/releases/latest" ||
+		fail "连不上 GitHub，查不到最新版本"
+
+	local tag date
+	tag=$(jsonfilter -i "$TMP/release.json" -e '@.tag_name' 2>/dev/null)
+	date=$(jsonfilter -i "$TMP/release.json" -e '@.published_at' 2>/dev/null)
+	[ -n "$tag" ] || fail "GitHub 返回的版本信息无法解析"
+
+	printf '{"version":"%s","published":"%s","checked":%s}\n' "$tag" "$date" "$(date +%s)" > "$LATEST"
+	rm -rf "$TMP"
+	state ok "最新版本 $tag" "\"latest\":\"$tag\""
+}
+
+core() {
+	local want=$1 cur got old
+
+	cur=$(core_version "$PROG")
+
+	if [ -z "$want" ]; then
+		core_check_quiet || fail "连不上 GitHub，查不到最新版本"
+		want=$(jsonfilter -i "$LATEST" -e '@.version')
+	fi
+
+	case "$want" in v[0-9]*.[0-9]*) ;; *) fail "版本号格式不对：$want" ;; esac
+	[ "$want" = "$cur" ] && { state ok "已经是 $cur" "\"version\":\"$cur\""; return 0; }
+
+	mkdir -p "$TMP"
+	state running "正在下载 mihomo $want（约 20 MB）" "\"from\":\"$cur\",\"to\":\"$want\""
+	fetch "$TMP/mihomo.gz" \
+		"https://github.com/$REPO/releases/download/$want/mihomo-linux-arm64-$want.gz" ||
+		fail "下载 $want 失败：GitHub 连不上"
+
+	state running "正在校验 $want" "\"from\":\"$cur\",\"to\":\"$want\""
+	gzip -dc "$TMP/mihomo.gz" > "$TMP/mihomo" 2>/dev/null || fail "下载的文件已损坏"
+	chmod 755 "$TMP/mihomo"
+
+	got=$(core_version "$TMP/mihomo")
+	[ "$got" = "$want" ] || fail "新内核无法运行（版本 ${got:-?}）"
+	"$TMP/mihomo" -t -d "$DIR" -f "$CONF" >/dev/null 2>&1 || fail "新内核不认当前配置，未替换"
+
+	state running "正在替换并重启" "\"from\":\"$cur\",\"to\":\"$want\""
+	cp "$PROG" "$PREV.tmp" && mv "$PREV.tmp" "$PREV"
+	cp "$TMP/mihomo" "$PROG.tmp" && mv "$PROG.tmp" "$PROG"
+	rm -rf "$TMP"
+
+	old=$(mihomo_pid)
+	restart_mihomo
+
+	if ! wait_api 40 "$old"; then
+		cp "$PREV" "$PROG.tmp" && mv "$PROG.tmp" "$PROG"
+		restart_mihomo
+		fail "$want 启动失败，已回滚到 $cur"
+	fi
+
+	state ok "已更新到 $want" "\"from\":\"$cur\",\"to\":\"$want\""
+}
+
+core_check_quiet() {
+	mkdir -p "$TMP"
+	fetch "$TMP/release.json" "https://api.github.com/repos/$REPO/releases/latest" || return 1
+	local tag date
+	tag=$(jsonfilter -i "$TMP/release.json" -e '@.tag_name' 2>/dev/null)
+	date=$(jsonfilter -i "$TMP/release.json" -e '@.published_at' 2>/dev/null)
+	[ -n "$tag" ] || return 1
+	printf '{"version":"%s","published":"%s","checked":%s}\n' "$tag" "$date" "$(date +%s)" > "$LATEST"
+}
+
+core_rollback() {
+	local cur prev old
+
+	[ -x "$PREV" ] || fail "没有可回滚的旧版本"
+	cur=$(core_version "$PROG")
+	prev=$(core_version "$PREV")
+
+	state running "正在回滚到 ${prev:-旧版本}"
+	cp "$PROG" "$TMP.cur" 2>/dev/null
+	cp "$PREV" "$PROG.tmp" && mv "$PROG.tmp" "$PROG"
+	[ -f "$TMP.cur" ] && mv "$TMP.cur" "$PREV"
+
+	old=$(mihomo_pid)
+	restart_mihomo
+	wait_api 40 "$old" || fail "回滚后 mihomo 没有起来"
+
+	state ok "已回滚到 ${prev:-旧版本}" "\"from\":\"$cur\",\"to\":\"$prev\""
+}
+
+case "$JOB" in
+	geo|core-check|core|core-rollback) ;;
+	*) echo "usage: $0 geo|core-check|core [vX.Y.Z]|core-rollback" >&2; exit 2 ;;
+esac
+
+mkdir -p /var/lock
+exec 9>"$LOCK"
+flock -n 9 || { echo "another update is running" >&2; exit 3; }
+
+case "$JOB" in
+	geo) geo ;;
+	core-check) core_check ;;
+	core) core "$2" ;;
+	core-rollback) core_rollback ;;
+esac

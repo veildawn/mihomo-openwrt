@@ -1,0 +1,114 @@
+#!/bin/sh /etc/rc.common
+# mihomo (Clash.Meta) service for f50clean / OpenWrt
+#   /etc/init.d/mihomo start|stop|restart|status|update|log
+START=99
+STOP=10
+USE_PROCD=1
+
+PROG=/usr/bin/mihomo
+CONF=/etc/mihomo
+PIDFILE=/var/run/mihomo.pid
+
+# 缺失、或比自带的一半还小（下载中断留下的半个文件）就换成固件自带的；
+# mmdb 另外检查末尾的 MaxMind 元数据标记
+seed_geo() {
+	local f have ship
+	for f in geoip.metadb GeoSite.dat; do
+		[ -f "/usr/share/mihomo/$f" ] || continue
+		ship=$(wc -c < "/usr/share/mihomo/$f")
+		have=$(wc -c < "$CONF/$f" 2>/dev/null || echo 0)
+		if [ "$have" -ge $((ship / 2)) ]; then
+			case "$f" in
+				*.metadb) tail -c 131072 "$CONF/$f" | grep -q 'MaxMind.com' && continue ;;
+				*) continue ;;
+			esac
+		fi
+		cp "/usr/share/mihomo/$f" "$CONF/$f.tmp" && mv "$CONF/$f.tmp" "$CONF/$f"
+		logger -t mihomo "using built-in $f (missing or incomplete)"
+	done
+}
+
+start_service() {
+	local META
+	META=$("$PROG" -v 2>/dev/null | sed -n 's/^Mihomo Meta \(v[^ ]*\).*/\1/p')
+
+	# 首次启动：准备目录
+	mkdir -p "$CONF/providers" "$CONF/ruleset" "$CONF/ui"
+
+	# 用当前订阅渲染 config.yaml；没有订阅就不启动（LuCI 里添加订阅后会自动启动）
+	if ! /usr/libexec/mihomo-genconf 2>/tmp/mihomo-genconf.err; then
+		logger -t mihomo "not started: $(cat /tmp/mihomo-genconf.err) (add one in LuCI -> Services -> Mihomo -> Subscriptions)"
+		return 0
+	fi
+
+	# GEO 数据库缺失或不完整时 mihomo 会在启动时下载，下载超时就直接退出、被 procd
+	# 无限重启（刷机后实测：90 秒一次，一直起不来）。所以先放好固件自带的那份。
+	# 不要在这里起后台下载：子进程会继承 procd_lock 的 fd 1000，下载期间所有
+	# /etc/init.d/mihomo 调用（含 LuCI 后端的 enabled/running）都会卡住；
+	# 在线更新走 /usr/libexec/mihomo-update。
+	seed_geo
+
+	echo "start mihomo ${META:-unknown} with $CONF/config.yaml" >&2
+	logger -t mihomo "starting ${META:-mihomo}"
+
+	procd_open_instance mihomo
+	procd_set_param command "$PROG" -d "$CONF" -f "$CONF/config.yaml"
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param file "$CONF/config.yaml"
+	procd_set_param limits core="unlimited" nofile="65535"
+	procd_close_instance
+
+	# tun 设备就绪后打一条日志（fw3 的 zone 已覆盖 Meta）。
+	# 先关掉继承来的 procd_lock fd 1000，否则这 30 秒内锁一直被占着。
+	(
+		exec 1000>&-
+		i=0
+		while [ $i -lt 30 ]; do
+			ip link show Meta >/dev/null 2>&1 && break
+			sleep 1
+			i=$((i + 1))
+		done
+		ip link show Meta >/dev/null 2>&1 && logger -t mihomo "tun device Meta is up"
+	) </dev/null >/dev/null 2>&1 &
+}
+
+stop_service() {
+	logger -t mihomo "stopping mihomo"
+	# 清理 tun 残留路由/规则（异常退出时）
+	ip link show Meta >/dev/null 2>&1 && ip link set Meta down 2>/dev/null
+	ip rule del fwmark 0x1a4 table 2022 2>/dev/null
+	ip rule del fwmark 0x1a4 2>/dev/null
+	ip route flush table 2022 2>/dev/null
+	return 0
+}
+
+service_triggers() {
+	# /etc/config/mihomo holds the subscriptions; a change re-renders config.yaml
+	procd_add_reload_trigger "mihomo"
+}
+
+status_service() {
+	pgrep -f "$PROG -d $CONF" >/dev/null 2>&1 && echo "mihomo is running" || echo "mihomo is stopped"
+}
+
+# 立即更新订阅
+update() {
+	local api="http://127.0.0.1:9090"
+	local secret
+	secret=$(sed -n 's/^secret: *"\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$CONF/config.yaml" | head -1)
+	uclient-fetch -q -O - --header="Authorization: Bearer $secret" \
+		-X PUT "$api/providers/proxies/Subscription" 2>/dev/null \
+		|| curl -sS -m 30 -X PUT -H "Authorization: Bearer $secret" "$api/providers/proxies/Subscription"
+}
+
+# 查看日志
+log() {
+	logread -e mihomo -f
+}
+
+EXTRA_COMMANDS="status update log"
+EXTRA_HELP="	status	Show mihomo status
+	update	Update the active subscription now
+	log	Follow mihomo logs"

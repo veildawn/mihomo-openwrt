@@ -1,0 +1,13 @@
+/usr/bin/mihomo
+/usr/bin/mihomo.prev
+/usr/libexec/mihomo-genconf
+/usr/libexec/mihomo-update
+/usr/share/mihomo
+/usr/share/luci/menu.d/luci-app-mihomo.json
+/usr/share/rpcd/acl.d/luci-app-mihomo.json
+/usr/share/rpcd/ucode/luci.mihomo
+/www/luci-static/resources/mihomo
+/www/luci-static/resources/view/mihomo
+/www/luci-static/resources/view/cellular/common.js
+/etc/mihomo
+/etc/init.d/mihomo
